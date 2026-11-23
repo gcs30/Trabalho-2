@@ -1,0 +1,534 @@
+#ifndef F_CPU
+#define F_CPU 16000000UL
+#endif
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/eeprom.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <ctype.h>
+
+#define BAUD            9600UL
+#define UBRR_VAL        ((F_CPU / (16UL * BAUD)) - 1)
+
+#define TICK_HZ         10U
+#define OCR1A_VAL       ((F_CPU / (256UL * TICK_HZ)) - 1)
+
+#define ADC_SAMPLES     16U
+#define ADC_SHIFT       4U
+
+#define SENSOR_RAW_MIN  10U
+#define SENSOR_RAW_MAX  1013U
+
+#define PUMP_PIN        PB0
+#define ALARM_PIN       PB1
+#define PUMP_ACTIVE_HIGH 1
+
+#define ALM_SENSOR      (1U << 0)
+#define ALM_CRIT_LOW    (1U << 1)
+#define ALM_CRIT_HIGH   (1U << 2)
+#define ALM_NO_FILL     (1U << 3)
+#define ALM_BLOCK_PUMP  (ALM_SENSOR | ALM_CRIT_HIGH | ALM_NO_FILL)
+
+typedef struct {
+    uint8_t  lvl_on;
+    uint8_t  lvl_off;
+    uint8_t  crit_low;
+    uint8_t  crit_high;
+    uint16_t t_max_s;
+    uint8_t  min_rise;
+    uint8_t  rep_s;
+    uint16_t cal_empty;
+    uint16_t cal_full;
+} __attribute__((packed)) params_t;
+
+typedef struct {
+    params_t p;
+    uint8_t  chk;
+} __attribute__((packed)) nv_t;
+
+static nv_t EEMEM ee_data;
+
+static const params_t PARAM_DEFAULT = {
+    .lvl_on = 30, .lvl_off = 80, .crit_low = 10, .crit_high = 95,
+    .t_max_s = 120, .min_rise = 2, .rep_s = 5,
+    .cal_empty = 100, .cal_full = 900
+};
+
+static params_t prm;
+
+static volatile uint8_t  tick_flag;
+static volatile uint8_t  adc_ready;
+static volatile uint16_t adc_acc;
+static volatile uint8_t  adc_n;
+static volatile uint16_t adc_avg;
+
+static uint16_t adc_last;
+static uint8_t  level;
+static uint8_t  alarms;
+static uint8_t  pump_on;
+static uint16_t pump_run_s;
+static uint8_t  level_ref;
+static uint8_t  tick_cnt, blink_cnt, rep_cnt;
+
+#define RX_SIZE 64U
+#define TX_SIZE 128U
+#define LINE_SIZE 32U
+
+static volatile uint8_t rx_buf[RX_SIZE];
+static volatile uint8_t rx_head, rx_tail;
+static volatile uint8_t tx_buf[TX_SIZE];
+static volatile uint8_t tx_head, tx_tail;
+
+ISR(USART_RX_vect)
+{
+    uint8_t d = UDR0;
+    uint8_t next = (rx_head + 1U) & (RX_SIZE - 1U);
+
+    if (next != rx_tail) {
+        rx_buf[rx_head] = d;
+        rx_head = next;
+    }
+}
+
+ISR(USART_UDRE_vect)
+{
+    UDR0 = tx_buf[tx_tail];
+    tx_tail = (tx_tail + 1U) & (TX_SIZE - 1U);
+
+    if (tx_tail == tx_head)
+        UCSR0B &= ~(1 << UDRIE0);
+}
+
+static void uart_init(void)
+{
+    UBRR0H = (uint8_t)(UBRR_VAL >> 8);
+    UBRR0L = (uint8_t)UBRR_VAL;
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0) | (1 << RXCIE0);
+}
+
+static void uart_putc(char c)
+{
+    uint8_t next = (tx_head + 1U) & (TX_SIZE - 1U);
+
+    while (next == tx_tail) { }
+
+    tx_buf[tx_head] = (uint8_t)c;
+    tx_head = next;
+    UCSR0B |= (1 << UDRIE0);
+}
+
+static void uart_puts(const char *s)
+{
+    while (*s) uart_putc(*s++);
+}
+
+static void uart_printf(const char *fmt, ...)
+{
+    char buf[96];
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+
+    uart_puts(buf);
+}
+
+ISR(TIMER1_COMPA_vect)
+{
+    tick_flag = 1;
+}
+
+static void timer1_init(void)
+{
+    TCCR1A = 0;
+    TCCR1B = (1 << WGM12) | (1 << CS12);
+    OCR1A  = (uint16_t)OCR1A_VAL;
+    TIMSK1 = (1 << OCIE1A);
+}
+
+ISR(ADC_vect)
+{
+    adc_acc += ADC;
+
+    if (++adc_n < ADC_SAMPLES) {
+        ADCSRA |= (1 << ADSC);
+    } else {
+        adc_avg = (uint16_t)((adc_acc + (ADC_SAMPLES / 2U)) >> ADC_SHIFT);
+        adc_ready = 1;
+    }
+}
+
+static void adc_init(void)
+{
+    ADMUX  = (1 << REFS0);
+    DIDR0  = (1 << ADC0D);
+
+    ADCSRA = (1 << ADEN) | (1 << ADIE) |
+             (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+}
+
+static uint8_t params_valid(const params_t *p)
+{
+    int16_t span = (int16_t)p->cal_full - (int16_t)p->cal_empty;
+
+    if (span < 0) span = -span;
+
+    return (p->crit_low < p->lvl_on) &&
+           (p->lvl_on  < p->lvl_off) &&
+           (p->lvl_off < p->crit_high) &&
+           (p->crit_high <= 100) &&
+           (p->cal_empty <= 1023) && (p->cal_full <= 1023) &&
+           (span >= 50);
+}
+
+static uint8_t checksum(const params_t *p)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    uint8_t c = 0xA5;
+
+    for (uint8_t i = 0; i < sizeof *p; i++)
+        c ^= b[i];
+
+    return c;
+}
+
+static void params_load(void)
+{
+    nv_t nv;
+
+    eeprom_read_block(&nv, &ee_data, sizeof nv);
+
+    if (nv.chk == checksum(&nv.p) && params_valid(&nv.p))
+        prm = nv.p;
+    else
+        prm = PARAM_DEFAULT;
+}
+
+static void params_save(void)
+{
+    nv_t nv;
+
+    nv.p = prm;
+    nv.chk = checksum(&nv.p);
+
+    eeprom_update_block(&nv, &ee_data, sizeof nv);
+}
+
+static uint8_t adc_to_level(uint16_t raw)
+{
+    int32_t span = (int32_t)prm.cal_full - (int32_t)prm.cal_empty;
+    int32_t l = (((int32_t)raw - (int32_t)prm.cal_empty) * 100L) / span;
+
+    if (l < 0)   l = 0;
+    if (l > 100) l = 100;
+
+    return (uint8_t)l;
+}
+
+static void uart_alarm_names(uint8_t a)
+{
+    if (a & ALM_SENSOR)    uart_puts(" SENSOR");
+    if (a & ALM_CRIT_LOW)  uart_puts(" CRITICO_BAIXO");
+    if (a & ALM_CRIT_HIGH) uart_puts(" CRITICO_ALTO");
+    if (a & ALM_NO_FILL)   uart_puts(" SEM_ENCHIMENTO");
+}
+
+static void alarms_set(uint8_t newa)
+{
+    if (newa == alarms) return;
+
+    alarms = newa;
+
+    if (alarms) {
+        uart_printf("ALERTA ALARME=0x%02X:", alarms);
+        uart_alarm_names(alarms);
+        uart_puts("\r\n");
+    } else {
+        uart_puts("OK ALARMES LIMPOS\r\n");
+    }
+}
+
+static void pump_set(uint8_t on)
+{
+    if (on == pump_on) return;
+
+    pump_on = on;
+
+#if PUMP_ACTIVE_HIGH
+    if (on) PORTB |= (1 << PUMP_PIN);
+    else PORTB &= ~(1 << PUMP_PIN);
+#else
+    if (on) PORTB &= ~(1 << PUMP_PIN);
+    else PORTB |= (1 << PUMP_PIN);
+#endif
+
+    if (on) {
+        pump_run_s = 0;
+        level_ref = level;
+    }
+
+    uart_printf("EVENTO BOMBA=%s NIVEL=%u%%\r\n",
+                on ? "ON" : "OFF", level);
+}
+
+static void on_adc(void)
+{
+    uint8_t a = alarms & ALM_NO_FILL;
+
+    adc_last = adc_avg;
+
+    if (adc_last < SENSOR_RAW_MIN || adc_last > SENSOR_RAW_MAX) {
+        a |= ALM_SENSOR;
+    } else {
+        level = adc_to_level(adc_last);
+
+        if (level <= prm.crit_low)  a |= ALM_CRIT_LOW;
+        if (level >= prm.crit_high) a |= ALM_CRIT_HIGH;
+    }
+
+    alarms_set(a);
+
+    if (alarms & ALM_BLOCK_PUMP) {
+        pump_set(0);
+    } else if (pump_on) {
+        if (level >= prm.lvl_off)
+            pump_set(0);
+    } else {
+        if (level <= prm.lvl_on)
+            pump_set(1);
+    }
+}
+
+static void print_status(void)
+{
+    uart_printf("NIVEL=%u%% BOMBA=%s ALARME=0x%02X TBOMBA=%us\r\n",
+                level, pump_on ? "ON" : "OFF", alarms, pump_run_s);
+}
+
+static void on_second(void)
+{
+    if (pump_on && prm.t_max_s) {
+        if (++pump_run_s >= prm.t_max_s) {
+            if ((int16_t)level < (int16_t)level_ref + prm.min_rise) {
+                alarms_set(alarms | ALM_NO_FILL);
+                pump_set(0);
+            } else {
+                level_ref = level;
+                pump_run_s = 0;
+            }
+        }
+    }
+
+    if (prm.rep_s && ++rep_cnt >= prm.rep_s) {
+        rep_cnt = 0;
+        print_status();
+    }
+}
+
+static void on_tick(void)
+{
+    adc_acc = 0;
+    adc_n = 0;
+
+    ADCSRA |= (1 << ADSC);
+
+    if (alarms) {
+        if (++blink_cnt >= 5) {
+            blink_cnt = 0;
+            PORTB ^= (1 << ALARM_PIN);
+        }
+    } else {
+        blink_cnt = 0;
+        PORTB &= ~(1 << ALARM_PIN);
+    }
+
+    if (++tick_cnt >= TICK_HZ) {
+        tick_cnt = 0;
+        on_second();
+    }
+}
+
+static uint8_t parse_uint(const char *s, uint16_t *out)
+{
+    uint32_t v = 0;
+
+    if (!*s) return 0;
+
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') return 0;
+
+        v = v * 10U + (uint32_t)(*s - '0');
+
+        if (v > 65535UL) return 0;
+    }
+
+    *out = (uint16_t)v;
+    return 1;
+}
+
+static uint8_t cmd_set(const char *name, uint16_t v)
+{
+    params_t np = prm;
+
+    if      (!strcmp(name, "MIN"))     { if (v > 100) return 0; np.lvl_on    = (uint8_t)v; }
+    else if (!strcmp(name, "MAX"))     { if (v > 100) return 0; np.lvl_off   = (uint8_t)v; }
+    else if (!strcmp(name, "CRITMIN")) { if (v > 100) return 0; np.crit_low  = (uint8_t)v; }
+    else if (!strcmp(name, "CRITMAX")) { if (v > 100) return 0; np.crit_high = (uint8_t)v; }
+    else if (!strcmp(name, "RISE"))    { if (v > 100) return 0; np.min_rise  = (uint8_t)v; }
+    else if (!strcmp(name, "REP"))     { if (v > 255) return 0; np.rep_s     = (uint8_t)v; }
+    else if (!strcmp(name, "TMAX"))    { np.t_max_s = v; }
+    else return 0;
+
+    if (!params_valid(&np)) return 0;
+
+    prm = np;
+    return 1;
+}
+
+static void print_params(void)
+{
+    uart_printf("MIN=%u MAX=%u CRITMIN=%u CRITMAX=%u\r\n",
+                prm.lvl_on, prm.lvl_off, prm.crit_low, prm.crit_high);
+
+    uart_printf("TMAX=%u RISE=%u REP=%u\r\n",
+                prm.t_max_s, prm.min_rise, prm.rep_s);
+
+    uart_printf("CAL_VAZIO=%u CAL_CHEIO=%u\r\n",
+                prm.cal_empty, prm.cal_full);
+}
+
+static void handle_command(char *line)
+{
+    char *tok[3];
+    uint8_t n = 0;
+
+    char *t = strtok(line, " ");
+
+    while (t && n < 3) {
+        tok[n++] = t;
+        t = strtok(NULL, " ");
+    }
+
+    if (n == 0) return;
+
+    if (!strcmp(tok[0], "GET") && n == 2) {
+        if (!strcmp(tok[1], "NIVEL"))
+            uart_printf("NIVEL=%u%% ADC=%u\r\n", level, adc_last);
+        else if (!strcmp(tok[1], "STATUS"))
+            print_status();
+        else if (!strcmp(tok[1], "PARAM"))
+            print_params();
+        else
+            uart_puts("ERRO ARGUMENTO\r\n");
+    }
+    else if (!strcmp(tok[0], "SET") && n == 3) {
+        uint16_t v;
+
+        if (parse_uint(tok[2], &v) && cmd_set(tok[1], v))
+            uart_puts("OK\r\n");
+        else
+            uart_puts("ERRO VALOR/PARAMETRO INVALIDO\r\n");
+    }
+    else if (!strcmp(tok[0], "CAL") && n == 2) {
+        params_t np = prm;
+
+        if      (!strcmp(tok[1], "VAZIO")) np.cal_empty = adc_last;
+        else if (!strcmp(tok[1], "CHEIO")) np.cal_full  = adc_last;
+        else {
+            uart_puts("ERRO ARGUMENTO\r\n");
+            return;
+        }
+
+        if (params_valid(&np)) {
+            prm = np;
+            uart_printf("OK ADC=%u\r\n", adc_last);
+        } else {
+            uart_puts("ERRO CALIBRACAO INVALIDA\r\n");
+        }
+    }
+    else if (!strcmp(tok[0], "SAVE") && n == 1) {
+        params_save();
+        uart_puts("OK SALVO\r\n");
+    }
+    else if (!strcmp(tok[0], "RESET") && n == 1) {
+        alarms_set(alarms & (uint8_t)~ALM_NO_FILL);
+        uart_puts("OK\r\n");
+    }
+    else if (!strcmp(tok[0], "HELP")) {
+        uart_puts("GET NIVEL|STATUS|PARAM\r\n"
+                  "SET MIN|MAX|CRITMIN|CRITMAX|TMAX|RISE|REP n\r\n"
+                  "CAL VAZIO|CHEIO  SAVE  RESET\r\n");
+    }
+    else {
+        uart_puts("ERRO COMANDO\r\n");
+    }
+}
+
+static void rx_process(void)
+{
+    static char line[LINE_SIZE];
+    static uint8_t len, overflow;
+
+    while (rx_tail != rx_head) {
+        char c = (char)rx_buf[rx_tail];
+        rx_tail = (rx_tail + 1U) & (RX_SIZE - 1U);
+
+        if (c == '\r' || c == '\n') {
+            if (overflow) {
+                uart_puts("ERRO LINHA LONGA\r\n");
+            } else if (len) {
+                line[len] = '\0';
+                handle_command(line);
+            }
+
+            len = 0;
+            overflow = 0;
+        } else if (len < LINE_SIZE - 1U) {
+            line[len++] = (char)toupper((unsigned char)c);
+        } else {
+            overflow = 1;
+        }
+    }
+}
+
+int main(void)
+{
+    DDRB |= (1 << PUMP_PIN) | (1 << ALARM_PIN);
+
+#if PUMP_ACTIVE_HIGH
+    PORTB &= ~(1 << PUMP_PIN);
+#else
+    PORTB |= (1 << PUMP_PIN);
+#endif
+
+    PORTB &= ~(1 << ALARM_PIN);
+
+    params_load();
+    timer1_init();
+    adc_init();
+    uart_init();
+
+    sei();
+
+    uart_puts("\r\nControle de nivel - ATmega328P (HELP para comandos)\r\n");
+
+    for (;;) {
+        if (tick_flag) {
+            tick_flag = 0;
+            on_tick();
+        }
+
+        if (adc_ready) {
+            adc_ready = 0;
+            on_adc();
+        }
+
+        rx_process();
+    }
+}
